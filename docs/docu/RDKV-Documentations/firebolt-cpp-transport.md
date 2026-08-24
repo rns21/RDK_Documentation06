@@ -52,7 +52,7 @@ RDKMW -->|"HAL APIs"| VL
 
 ## Design
 
-The library is structured as a layered stack. The outermost layer (`IHelper` / `SubscriptionManager`) provides a type-safe, RAII-managed interface that maps SDK-level operations to JSON-RPC method names and typed JSON deserializers. Beneath that, `IGateway` (implemented by `GatewayImpl`) owns the JSON-RPC protocol logic: it generates message IDs, tracks outstanding promises in a `Client` sub-object, manages event listeners in a `Server` sub-object, and runs a watchdog thread that enforces request timeouts. The innermost layer (`Transport`) owns the WebSocket connection using `websocketpp` with an Asio event loop and decouples received message payloads from protocol processing through an internal message queue.
+The library is structured as a layered stack. The outermost layer (`IHelper` / `SubscriptionManager`) provides a type-safe, RAII-managed interface that maps SDK-level operations to JSON-RPC method names and typed JSON deserializers. Beneath that, `IGateway` owns the JSON-RPC protocol logic: it generates message IDs, correlates responses to outstanding requests, manages event listener registration, and runs a watchdog thread that enforces request timeouts. The innermost layer (`Transport`) owns the WebSocket connection using `websocketpp` with an Asio event loop and decouples received message payloads from protocol processing through an internal message queue.
 
 Northbound callers interact only through the `IGateway` and `IHelper` abstract interfaces. Implementation types are kept internal; `GetGatewayInstance()` and `GetHelperInstance()` return stable references scoped to the process lifetime. All data flow through these interfaces is outbound toward the Firebolt gateway daemon.
 
@@ -70,14 +70,11 @@ graph TD
         end
 
         subgraph GWImpl["GatewayImpl (gateway.cpp)"]
-            CLI["Client\nRequest/Response Correlation"]
-            SRV["Server\nEvent Notification Dispatch"]
-            WDG["Watchdog Thread\nTimeout Detection"]
+            GWCORE["Request/Response Correlation\nEvent Dispatch · Watchdog Timeout"]
         end
 
         subgraph TPLayer["Transport (transport.h/cpp)"]
-            WSPP["websocketpp Client\nAsio Event Loop"]
-            MWQ["Message Worker Thread\nQueue Processing"]
+            WSPP["WebSocket Client\n(websocketpp / Asio)"]
         end
 
         subgraph SupportLayer["Support"]
@@ -91,25 +88,20 @@ graph TD
 
     SM --> IH
     IH --> IGW
-    IGW --> CLI
-    IGW --> SRV
-    CLI --> WSPP
-    WSPP --> MWQ
-    MWQ --> CLI
-    MWQ --> SRV
-    WDG --> CLI
+    IGW --> GWCORE
+    GWCORE --> WSPP
     WSPP <-->|"WebSocket / JSON-RPC 2.0"| ExtGW
 ```
 
 #### Threading Model
 
 - **Threading Architecture**: Multi-threaded — four distinct threads collaborate to decouple I/O, message processing, event dispatch, and timeout enforcement.
-- **Connection Thread** (`connectionThread_` in `Transport`): Runs the `websocketpp` Asio event loop (`client::run()`). Handles WebSocket open, close, fail, and message events. Invokes `onConnectionChange` callbacks on the calling thread for the initial result; subsequent connection-change callbacks fire on this thread.
-- **Message Worker Thread** (`messageWorkerThread_` in `Transport`): Dequeues raw JSON payloads from `messageQueue_` and forwards parsed `nlohmann::json` objects to `GatewayImpl::onMessage()`. This thread owns the parse step and keeps the connection thread unblocked.
-- **Notification Worker Thread** (`notificationWorkerThread_` in `Server`): Dequeues `QueuedNotification` entries and invokes registered `EventCallback` functions. Running callbacks on this separate thread prevents event handlers from blocking or deadlocking the message worker.
-- **Watchdog Thread** (`watchdogThread` in `GatewayImpl`): Sleeps for `watchdogCycle_ms` (default 500 ms) between iterations and calls `Client::checkPromises()` to expire pending requests older than `waitTime_ms` with `Error::Timedout`.
-- **Synchronization**: `messageQueueMutex_` / `messageQueueCv_` guard the message queue; `notificationQueueMutex_` / `notificationQueueCv_` guard the notification queue; `queue_mtx` in `Client` guards the pending request map; `eventMap_mtx` in `Server` guards the event listener list; `responseHeadersMutex_` guards the response header map. Promises are fulfilled and event callbacks are invoked outside their respective locks to minimise contention and prevent deadlocks.
-- **Async / Event Dispatch**: Callers receive a `std::future<Result<nlohmann::json>>` from `IGateway::request()`. The connection thread fulfils the promise when the matching response arrives or when the watchdog times it out. Event notifications are posted from the connection thread onto the notification queue and dispatched asynchronously on the notification worker thread.
+- **Connection Thread**: Runs the WebSocket Asio event loop and handles connection open, close, fail, and message events. Invokes the `ConnectionChangeCallback` on the calling thread for the initial result; subsequent callbacks fire on this thread.
+- **Message Worker Thread**: Dequeues raw WebSocket payloads, parses them as JSON, and routes responses and event notifications to the appropriate handlers. Keeps the connection thread unblocked during parsing.
+- **Notification Worker Thread**: Dequeues and dispatches incoming event notifications to registered callbacks asynchronously, preventing event handlers from blocking the message worker.
+- **Watchdog Thread**: Wakes at the interval configured by `watchdogCycle_ms` and expires pending requests older than `waitTime_ms` with `Error::Timedout`.
+- **Synchronization**: Dedicated mutexes guard the message queue, notification queue, pending request map, event listener list, and response header map. Promises are fulfilled and event callbacks are invoked outside their respective locks to minimise contention and prevent deadlocks.
+- **Async / Event Dispatch**: Callers receive a `std::future<Result<nlohmann::json>>` from `IGateway::request()`. The response is matched by message ID and delivered when the gateway reply arrives or the watchdog timeout expires. Event notifications are dispatched asynchronously on the notification worker thread.
 
 ### Prerequisites and Dependencies
 
@@ -131,48 +123,40 @@ The component transitions through the following states during its lifecycle: **N
 ```mermaid
 sequenceDiagram
     participant Caller as Caller (Firebolt C++ SDK)
-    participant GW as GatewayImpl
+    participant IGW as IGateway
     participant TP as Transport
-    participant WS as websocketpp / Asio
     participant FGW as Firebolt Gateway Daemon
 
-    Caller->>GW: IGateway::connect(config, onConnectionChange)
-    GW->>GW: Configure Logger (level, format)
-    GW->>GW: Build WebSocket URL (buildGatewayUrl)
-    GW->>TP: Transport::connect(url, headers, callbacks)
-    TP->>WS: init_asio(), start_perpetual()
-    TP->>TP: Start connection thread (client::run)
-    TP->>TP: Start message worker thread
-    WS->>FGW: TCP connect + WebSocket upgrade handshake
-    FGW-->>WS: HTTP 101 Switching Protocols
-    WS->>TP: onOpen callback
-    TP-->>GW: ConnectionCallback(connected=true)
-    GW->>GW: Start watchdog thread
-    GW-->>Caller: onConnectionChange(connected=true, Error::None)
+    Caller->>IGW: connect(config, onConnectionChange)
+    IGW->>IGW: Configure logger and build WebSocket URL
+    IGW->>TP: Connect to gateway URL with headers
+    TP->>FGW: TCP connect + WebSocket handshake
+    FGW-->>TP: HTTP 101 Switching Protocols
+    TP-->>IGW: Connection established
+    IGW->>IGW: Start watchdog thread
+    IGW-->>Caller: onConnectionChange(connected=true, Error::None)
 
     loop Runtime
-        Caller->>GW: request / subscribe / send
-        FGW-->>GW: JSON-RPC response / notification
+        Caller->>IGW: request / subscribe / send
+        FGW-->>IGW: JSON-RPC response / notification
     end
 
-    Caller->>GW: IGateway::disconnect()
-    GW->>TP: Transport::disconnect()
-    TP->>WS: Close WebSocket (100 ms handshake timeout)
-    WS->>TP: onClose callback
-    GW->>GW: Stop watchdog thread
-    GW->>GW: Cancel pending requests (Error::NotConnected)
-    GW->>GW: Stop notification worker
-    GW-->>Caller: disconnect() returns Error::None
+    Caller->>IGW: disconnect()
+    IGW->>TP: Close WebSocket connection
+    TP->>FGW: WebSocket close handshake
+    FGW-->>TP: Connection closed
+    IGW->>IGW: Stop watchdog, cancel pending requests
+    IGW-->>Caller: disconnect() returns Error::None
 ```
 
 #### Runtime State Changes
 
-During normal operation the library reacts to WebSocket close or fail events delivered by the connection thread. On `onClose` or `onFail`, `GatewayImpl::onConnectionChange()` is invoked, which notifies the registered `ConnectionChangeCallback` with `connected = false`. Pending requests are cancelled with `Error::NotConnected`. The watchdog thread continues running until `disconnect()` is called explicitly.
+During normal operation the library reacts to WebSocket close or fail events delivered by the connection thread. These events trigger the registered `ConnectionChangeCallback` with `connected = false`. Pending requests are resolved with `Error::NotConnected`. The watchdog thread continues running until `disconnect()` is called explicitly.
 
 **State Change Triggers:**
 
-- **Gateway daemon disconnect**: When the remote gateway closes the WebSocket, the connection thread fires `onClose`. All pending `Client` promises are resolved with `Error::NotConnected`. Callers must invoke `IGateway::connect()` again to re-establish the connection.
-- **Handshake failure / network error**: Reported via `onFail`. The transport transitions to `Disconnected` and the caller's `ConnectionChangeCallback` is invoked with the mapped `Firebolt::Error`.
+- **Gateway daemon disconnect**: When the remote gateway closes the WebSocket, all pending requests are resolved with `Error::NotConnected` and the registered callback is notified. Callers invoke `IGateway::connect()` again to re-establish the connection.
+- **Handshake failure / network error**: The transport transitions to `Disconnected` and the caller's `ConnectionChangeCallback` is invoked with the mapped `Firebolt::Error`.
 - **Request timeout**: Detected by the watchdog thread. The promise for the timed-out request is resolved with `Error::Timedout`; the connection itself is not affected.
 
 **Context Switching Scenarios:**
@@ -189,49 +173,40 @@ During normal operation the library reacts to WebSocket close or fail events del
 ```mermaid
 sequenceDiagram
     participant Caller as Caller (Firebolt C++ SDK)
-    participant GW as GatewayImpl
-    participant UTL as Utils (buildGatewayUrl)
+    participant IGW as IGateway
     participant TP as Transport
-    participant WS as websocketpp
+    participant FGW as Firebolt Gateway Daemon
 
-    Caller->>GW: connect(config, onConnectionChange)
-    GW->>GW: resolveLogLevelFromEnvironment(config.log.level)
-    GW->>GW: Logger::setLogLevel / setFormat
-    GW->>UTL: buildGatewayUrl(config.wsUrl, legacyRPCv1)
-    UTL-->>GW: Constructed URL with RPCv2 query param
-    GW->>TP: Transport::connect(url, headers, ...)
-    TP->>WS: init_asio, start_perpetual, connectionThread start
-    TP->>TP: startMessageWorker
-    WS-->>TP: onOpen (connected)
-    TP-->>GW: ConnectionCallback(true, Error::None)
-    GW->>GW: Start watchdog thread
-    GW-->>Caller: onConnectionChange(true, Error::None)
+    Caller->>IGW: connect(config, onConnectionChange)
+    IGW->>IGW: Configure logger and build WebSocket URL
+    IGW->>TP: Connect to gateway URL with headers
+    TP->>FGW: TCP connect + WebSocket handshake
+    FGW-->>TP: HTTP 101 Switching Protocols
+    TP-->>IGW: Connection established
+    IGW->>IGW: Start watchdog thread
+    IGW-->>Caller: onConnectionChange(true, Error::None)
 ```
 
 #### Request Processing Call Flow
 
-Incoming parameters are forwarded to `IGateway::request()`, which generates a unique message ID and stores a `std::promise` keyed by that ID in the `Client` pending map. The request is serialised to JSON-RPC 2.0 format and sent via `Transport::send()`. When the response arrives on the connection thread, the message worker dequeues and parses it; `Client::response()` matches the `id` field, removes the entry from the map, and fulfils the promise. The `std::future` returned to the caller becomes ready with a typed `Result<T>` value.
+Incoming parameters are forwarded to `IGateway::request()`, which assigns a unique message ID, serialises the call as a JSON-RPC 2.0 request, and tracks it internally. When the matching response arrives from the gateway, it is matched by ID and used to fulfil the outstanding `std::future`, which the caller receives as a typed `Result<T>` value.
 
 ```mermaid
 sequenceDiagram
     participant SDK as Firebolt C++ SDK
-    participant IH as IHelper (HelperImpl)
-    participant IGW as IGateway (GatewayImpl)
-    participant CLI as Client
+    participant IH as IHelper
+    participant IGW as IGateway
     participant TP as Transport
     participant FGW as Firebolt Gateway Daemon
 
     SDK->>IH: get<JsonType, T>("module.method", params)
     IH->>IGW: request("module.method", params)
-    IGW->>CLI: Client::request(method, params)
-    CLI->>TP: Transport::send(method, params, id)
-    TP->>FGW: JSON-RPC 2.0 request { id, method, params }
-    FGW-->>TP: JSON-RPC 2.0 response { id, result }
-    TP->>TP: Message worker dequeues payload
-    TP->>CLI: GatewayImpl::onMessage → Client::response(id, result)
-    CLI->>CLI: promise.set_value(Result<json>)
-    IGW-->>IH: future.get() → Result<json>
-    IH->>IH: JsonType::fromJson(json)
+    IGW->>TP: send JSON-RPC request with unique message ID
+    TP->>FGW: WebSocket frame { jsonrpc, method, params, id }
+    FGW-->>TP: WebSocket frame { jsonrpc, result, id }
+    TP->>IGW: deliver parsed response (matched by id)
+    IGW-->>IH: Result<json>
+    IH->>IH: deserialise to typed value
     IH-->>SDK: Result<T>
 ```
 
@@ -242,10 +217,8 @@ sequenceDiagram
 | Module / Class           | Description                                                                                                                                                                                                   | Key Files                                                                  |
 | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
 | `IGateway`               | Public abstract interface for JSON-RPC 2.0 over WebSocket. Exposes `connect`, `disconnect`, `send`, `request`, `subscribe`, `unsubscribe`, and `getResponseHeader`.                                           | `include/firebolt/gateway.h`                                               |
-| `GatewayImpl`            | Concrete implementation of `IGateway`. Coordinates the `Client`, `Server`, `Transport`, and watchdog thread. Implements JSON-RPC message routing and connection lifecycle.                                    | `src/gateway.cpp`                                                          |
-| `Client`                 | Tracks outstanding JSON-RPC requests. Maps message IDs to `std::promise` instances. Fulfils promises on response receipt. Cancels all pending promises on disconnect.                                         | `src/gateway.cpp`                                                          |
-| `Server`                 | Maintains the registered event callback list. Routes incoming JSON-RPC notifications to matching subscribers via a dedicated notification worker thread.                                                      | `src/gateway.cpp`                                                          |
-| `Transport`              | Manages the `websocketpp` client, Asio event loop, connection thread, and message worker thread. Translates WebSocket events into typed callbacks for `GatewayImpl`.                                          | `src/transport.h`, `src/transport.cpp`                                     |
+| `GatewayImpl`            | Concrete implementation of `IGateway`. Manages JSON-RPC request/response correlation, event listener registration and dispatch, connection lifecycle, and watchdog-based timeout enforcement.                 | `src/gateway.cpp`                                                          |
+| `Transport`              | Manages the WebSocket connection using `websocketpp` with an Asio event loop. Handles the connection lifecycle and delivers received frames to the protocol layer.                                            | `src/transport.h`, `src/transport.cpp`                                     |
 | `IHelper` / `HelperImpl` | Typed wrapper over `IGateway`. Provides `get<T>`, `set`, `invoke`, `subscribe`, and `unsubscribe` with `Result<T>` returns and automatic JSON de/serialisation.                                               | `include/firebolt/helpers.h`, `src/helpers_impl.h`, `src/helpers_impl.cpp` |
 | `SubscriptionManager`    | RAII helper that owns a set of subscriptions on behalf of a caller. Automatically calls `unsubscribeAll()` on destruction to prevent dangling callbacks.                                                      | `include/firebolt/helpers.h`, `src/helpers_impl.cpp`                       |
 | `Logger`                 | Thread-safe, level-filtered logger. Writes formatted lines to stderr or a file. Supports syslog output when built with `ENABLE_SYSLOG`. Log level and output path are configurable via environment variables. | `include/firebolt/logger.h`, `src/logger.cpp`                              |
@@ -273,9 +246,9 @@ The library communicates with the Firebolt gateway daemon over a WebSocket conne
 
 The library receives JSON-RPC notifications from the Firebolt gateway daemon and dispatches them to locally registered callbacks.
 
-| Incoming Notification                                    | Source                  | Dispatch Mechanism                                                | Local Subscriber                              |
-| -------------------------------------------------------- | ----------------------- | ----------------------------------------------------------------- | --------------------------------------------- |
-| Any registered event name (e.g., `device.onNameChanged`) | Firebolt Gateway Daemon | `Server::notify()` → notification worker thread → `EventCallback` | Caller-registered via `IGateway::subscribe()` |
+| Incoming Notification                                    | Source                  | Dispatch Mechanism                             | Local Subscriber                              |
+| -------------------------------------------------------- | ----------------------- | ---------------------------------------------- | --------------------------------------------- |
+| Any registered event name (e.g., `device.onNameChanged`) | Firebolt Gateway Daemon | `IGateway` internal dispatch → `EventCallback` | Caller-registered via `IGateway::subscribe()` |
 
 ### IPC Flow Patterns
 
@@ -286,15 +259,15 @@ The library accepts a method name and JSON parameters from the caller. It assign
 ```mermaid
 sequenceDiagram
     participant SDK as Firebolt C++ SDK
-    participant IGW as IGateway (GatewayImpl)
+    participant IGW as IGateway
     participant TP as Transport
     participant FGW as Firebolt Gateway Daemon
 
     SDK->>IGW: request("module.method", params)
-    IGW->>TP: Transport::send(JSON-RPC request, id)
+    IGW->>TP: send JSON-RPC request with unique message ID
     TP->>FGW: WebSocket frame { jsonrpc, method, params, id }
     FGW-->>TP: WebSocket frame { jsonrpc, result, id }
-    TP->>IGW: Message worker → GatewayImpl::onMessage
+    TP->>IGW: deliver parsed response (matched by id)
     IGW->>SDK: future resolved → Result<json>
 ```
 
@@ -306,16 +279,14 @@ Incoming JSON-RPC notifications (messages without an `id` field) are matched by 
 sequenceDiagram
     participant FGW as Firebolt Gateway Daemon
     participant TP as Transport
-    participant SRV as Server (GatewayImpl)
-    participant NW as Notification Worker Thread
-    participant CB1 as Subscriber Callback 1
-    participant CB2 as Subscriber Callback 2
+    participant IGW as IGateway
+    participant CB1 as Registered Callback 1
+    participant CB2 as Registered Callback 2
 
     FGW->>TP: WebSocket frame { jsonrpc, method, params }
-    TP->>SRV: Message worker → GatewayImpl::onMessage → Server::notify
-    SRV->>NW: Enqueue QueuedNotification (callbacks + params)
-    NW->>CB1: EventCallback(usercb, json params)
-    NW->>CB2: EventCallback(usercb, json params)
+    TP->>IGW: parsed notification (matched by event name)
+    IGW->>CB1: EventCallback(params)
+    IGW->>CB2: EventCallback(params)
 ```
 
 ---
@@ -324,18 +295,17 @@ sequenceDiagram
 
 ### Key Implementation Logic
 
-- **State / Lifecycle Management**: Connection state is tracked via the `TransportState` enum (`NotStarted`, `Connecting`, `Connected`, `Disconnected`) held in an `std::atomic` field in `Transport`. State transitions are driven by `websocketpp` callbacks (`onOpen`, `onClose`, `onFail`). The `GatewayImpl` watchdog thread is started on successful connection and stopped on `disconnect()`.
+- **State / Lifecycle Management**: Connection state transitions through `NotStarted`, `Connecting`, `Connected`, and `Disconnected` phases, driven by WebSocket lifecycle events. The watchdog thread is started on successful connection and stopped on `disconnect()`.
   - Connection state: `src/transport.cpp`, `src/transport.h`
   - Watchdog and gateway lifecycle: `src/gateway.cpp`
 
-- **Event Processing**: Incoming WebSocket frames are pushed onto `messageQueue_` (protected by `messageQueueMutex_`) and signalled via `messageQueueCv_`. The message worker thread dequeues and parses each frame as JSON. Frames with an `id` field are routed to `Client::response()`; frames without an `id` are treated as notifications and routed to `Server::notify()`. `Server::notify()` collects matching callbacks under `eventMap_mtx`, enqueues the notification to the notification worker thread, and returns immediately. The notification worker thread dispatches each callback, catching and logging all exceptions to prevent one faulty callback from blocking others.
+- **Event Processing**: Incoming WebSocket frames are queued and processed by the message worker thread, which parses each frame as JSON and routes it based on whether it carries a response ID (directed to the pending request) or an event method name (directed to registered subscribers). Subscriber callbacks are dispatched asynchronously; exceptions thrown by individual callbacks are caught and logged so that one faulty handler cannot affect others.
   - Message queue and worker: `src/transport.cpp`
   - Notification queue and worker: `src/gateway.cpp`
 
-- **Error Handling Strategy**: All public API calls return `Firebolt::Error` or `Result<T>`. JSON-RPC error responses are parsed defensively: missing or incorrectly typed `code` / `message` fields are replaced with safe defaults and logged as warnings. Websocketpp error codes are mapped to `Firebolt::Error` values in `mapError()`. Timed-out requests are fulfilled with `Error::Timedout` by the watchdog without disrupting the connection. Pending requests at disconnect time are fulfilled with `Error::NotConnected` via `Client::cancelAll()`.
-  - Error mapping: `src/transport.cpp` (`mapError`)
-  - Request timeout: `src/gateway.cpp` (`Client::checkPromises`)
-  - Disconnect cancellation: `src/gateway.cpp` (`Client::cancelAll`)
+- **Error Handling Strategy**: All public API calls return `Firebolt::Error` or `Result<T>`. JSON-RPC error responses are parsed defensively, replacing missing or malformed fields with safe defaults. WebSocket transport errors are mapped to `Firebolt::Error` values. Timed-out requests are expired by the watchdog without disrupting the connection, and pending requests are cancelled gracefully on disconnect.
+  - Error mapping: `src/transport.cpp`
+  - Request timeout and disconnect cancellation: `src/gateway.cpp`
 
 - **Security — URL Credential Redaction**: Before logging, the transport strips userinfo (user:pass@) and query parameters from the WebSocket URL to prevent credentials or tokens from appearing in log output.
   - URL redaction: `src/transport.cpp`, `src/gateway.cpp`
