@@ -24,7 +24,7 @@ end
 
 subgraph RDKMW["RDK Core Middleware"]
     FBService["Firebolt Platform Service"]
-    Thunder["WPEFramework Thunder"]
+    Thunder["WPEFramework/Thunder"]
     AM["App Manager"]
     Westeros["Westeros"]
 end
@@ -50,18 +50,18 @@ class HAL VL
 - **Asynchronous Connection Management**: The `Connect()` method initiates a WebSocket connection to the Firebolt service endpoint and delivers the connection result (success or error) asynchronously via a caller-supplied `OnConnectionChanged` callback; applications must wait for this callback before invoking API methods.
 - **Domain Interface Segregation**: Each Firebolt capability area (Accessibility, Advertising, Actions, Device, Discovery, Display, Lifecycle, Localization, Metrics, Network, Presentation, Stats, TextToSpeech) is exposed as an independent abstract interface, allowing applications to consume only the domains they require.
 - **Event Subscription Model**: Interfaces that expose platform state changes (e.g., HDR format changes, network connectivity, lifecycle state, closed-caption settings) provide typed `subscribe*` methods returning a `SubscriptionId`; subscriptions can be cancelled individually via `unsubscribe()` or collectively via `unsubscribeAll()`.
-- **JSON-RPC Method Dispatch**: Each domain implementation translates C++ method calls into JSON-RPC requests by constructing `nlohmann::json` parameter objects and forwarding them to the transport helper; responses are deserialized into typed C++ return structures using dedicated JSON type adapters located in `json_types/`.
+- **JSON-RPC Method Dispatch**: Each domain implementation translates C++ method calls into JSON-RPC requests and forwards them to the transport; responses are deserialized into typed C++ return structures using dedicated JSON type adapters located in `json_types/`.
 - **Protocol Compatibility**: The transport dependency supports both a legacy RPC-v1 wire protocol and a JSON-RPC v2-compliant protocol, allowing the client to operate with both older and newer Firebolt service implementations.
 
 ---
 
 ## Design
 
-The library is designed around a single abstract interface (`IFireboltAccessor`) that aggregates all Firebolt domain interfaces under one managed connection. The design avoids static coupling between domains: each domain module (e.g., `DeviceImpl`, `LifecycleImpl`) is independently constructed and holds only a reference to a shared `Firebolt::Helpers::IHelper` instance provided by the transport layer. This helper acts as the sole point of contact between domain implementations and the transport, offering generic `get()` and `invoke()` methods that accept a JSON-RPC method name and serialized parameters. JSON serialization and deserialization are handled by thin adapter structs defined in the `json_types/` subdirectory, keeping protocol-level concerns isolated from domain logic.
+The library is designed around a single abstract interface (`IFireboltAccessor`) that aggregates all Firebolt domain interfaces under one managed connection. The design avoids static coupling between domains: each domain module (e.g., `DeviceImpl`, `LifecycleImpl`) is independently constructed and delegates all platform communication to the `firebolt-cpp-transport` package. JSON serialization and deserialization are handled by thin adapter structs defined in the `json_types/` subdirectory, keeping protocol-level concerns isolated from domain logic.
 
 On the northbound side, the library presents pure abstract C++ interfaces defined in `include/firebolt/`. Applications link against these headers and the shared library, and obtain interface references via the `IFireboltAccessor` — the concrete implementation type remains internal. On the southbound side, all communication flows through the `FireboltTransport` package, which manages the WebSocket lifecycle and multiplexes JSON-RPC requests and event subscriptions.
 
-Event subscriptions are managed through a `SubscriptionManager` helper, instantiated per domain, that maintains a mapping from `SubscriptionId` to the caller-supplied `std::function` callback. When the platform fires an event, the transport delivers a JSON payload to the registered handler, which the `SubscriptionManager` deserializes using the appropriate JSON type adapter and dispatches to the stored callback. The `FireboltAccessorImpl` destructor calls `unsubscribeAll()` across every domain that supports subscriptions, releasing all active handlers when the connection is torn down.
+Each domain that supports events maintains a per-domain subscription registry, mapping a `SubscriptionId` to the caller-supplied `std::function` callback. When the platform fires an event, the transport delivers the payload to the registered handler, which deserializes it and invokes the callback. The `FireboltAccessorImpl` destructor calls `unsubscribeAll()` across every domain that supports subscriptions, releasing all active handlers when the connection is torn down.
 
 All state is session-scoped and tied to the lifetime of the active WebSocket connection. Connection configuration (endpoint URL, log level, protocol selection) is supplied by the caller through the `Firebolt::Config` parameter passed to `Connect()`.
 
@@ -104,8 +104,8 @@ SM -->|"event dispatch"| GW
 - **Threading Architecture**: Multi-threaded; thread management and WebSocket event dispatch are handled by the `firebolt-cpp-transport` layer.
 - **Main Thread**: Application code calls `Connect()`, retrieves domain interfaces, and invokes API methods from its own thread context.
 - **Async Connection Callback**: The `OnConnectionChanged` callback supplied to `Connect()` is invoked by the transport once the WebSocket handshake completes or fails. The thread on which this callback is delivered is determined by the transport layer.
-- **Event Callbacks**: Subscription callbacks (`std::function` objects stored in `SubscriptionManager`) are invoked by the transport when an event notification is received, and delivered directly to the registered handler on the transport's dispatch thread.
-- **Synchronization**: The `SubscriptionManager` holds a per-domain map of active subscriptions. Concurrent access safety for this map is delegated to the transport's `IHelper` implementation. The `FireboltAccessorImpl` is non-copyable to prevent shared-state races through duplication.
+- **Event Callbacks**: Subscription callbacks are invoked by the transport when an event notification is received, and delivered directly to the registered handler on the transport's dispatch thread.
+- **Synchronization**: Per-domain subscription state is managed by the transport layer. The `FireboltAccessorImpl` is non-copyable to prevent shared-state races through duplication.
 
 ### Prerequisites and Dependencies
 
@@ -133,14 +133,14 @@ sequenceDiagram
 
     App->>Accessor: Instance()
     App->>Accessor: Connect(config, onConnectionChanged)
-    Accessor->>Transport: GetGatewayInstance().connect(config, listener)
-    Transport->>FBService: WebSocket connect (ws://endpoint)
+    Accessor->>Transport: connect (delegates to transport)
+    Transport->>FBService: WebSocket connect
     FBService-->>Transport: Connection established
     Transport-->>App: onConnectionChanged(true, OK)
 
     loop Runtime API calls
         App->>Accessor: DeviceInterface().chipsetId()
-        Accessor->>Transport: helper_.get("Device.chipsetId")
+        Accessor->>Transport: JSON-RPC request (Device.chipsetId)
         Transport->>FBService: JSON-RPC request
         FBService-->>Transport: JSON-RPC response
         Transport-->>App: Result<string>
@@ -148,7 +148,7 @@ sequenceDiagram
 
     App->>Accessor: Disconnect()
     Accessor->>Accessor: unsubscribeAll()
-    Accessor->>Transport: GetGatewayInstance().disconnect()
+    Accessor->>Transport: disconnect
     Transport->>FBService: WebSocket close
 ```
 
@@ -178,28 +178,28 @@ sequenceDiagram
     App->>Accessor: IFireboltAccessor::Instance()
     Note over Accessor: Constructs all domain impl objects
     App->>Accessor: Connect(Config, callback)
-    Accessor->>Transport: GetGatewayInstance().connect(config, listener)
+    Accessor->>Transport: delegates connection setup
     Transport-->>App: callback(true, OK)
     Note over App: Domain interfaces ready for use
 ```
 
 #### Request Processing Call Flow
 
-An API get request (e.g., `Device.chipsetId`) follows a synchronous request/response pattern over the transport layer. Parameters are serialized to JSON before dispatch, and the JSON response is deserialized into the typed C++ return value.
+Each domain method call is translated into a JSON-RPC request and dispatched to the Firebolt platform service via the transport. The platform response is deserialized into the typed C++ return value.
 
 ```mermaid
 sequenceDiagram
     participant App as Application
     participant DomainImpl as DeviceImpl
-    participant Helper as IHelper (Transport)
+    participant Transport as firebolt-cpp-transport
     participant FBService as Firebolt Platform Service
 
     App->>DomainImpl: chipsetId()
-    DomainImpl->>Helper: get<JSON::String, string>("Device.chipsetId")
-    Helper->>FBService: JSON-RPC: {"method":"Device.chipsetId","params":{}}
-    FBService-->>Helper: {"result":"BCM72180"}
-    Helper-->>DomainImpl: Result<string>("BCM72180")
-    DomainImpl-->>App: Result<string>("BCM72180")
+    DomainImpl->>Transport: JSON-RPC request (Device.chipsetId)
+    Transport->>FBService: JSON-RPC request
+    FBService-->>Transport: JSON-RPC response
+    Transport-->>DomainImpl: Result<string>
+    DomainImpl-->>App: Result<string>
 ```
 
 ---
@@ -223,22 +223,20 @@ sequenceDiagram
 | `PresentationImpl`     | Implements `IPresentation`. Queries whether the application is currently focused (receiving key presses) and subscribes to focus change events.                                                                                                                                                                                                                                     | `src/presentation_impl.cpp`, `src/presentation_impl.h`   |
 | `StatsImpl`            | Implements `IStats`. Returns container memory statistics including user memory and GPU memory usage and limits via `memoryUsage()`.                                                                                                                                                                                                                                                 | `src/stats_impl.cpp`, `src/stats_impl.h`                 |
 | `TextToSpeechImpl`     | Implements `ITextToSpeech`. Provides TTS control: `listVoices()`, `speak()`, `pause()`, `resume()`, `cancel()`, `getSpeechState()`, and event subscriptions for speech lifecycle (willSpeak, speechStart, speechPause, speechResume, speechComplete, speechInterrupted, networkError, playbackError).                                                                               | `src/texttospeech_impl.cpp`, `src/texttospeech_impl.h`   |
-| `SubscriptionManager`  | Transport-layer helper (from `firebolt-cpp-transport`) instantiated per domain. Maintains a `SubscriptionId`-to-callback map, forwards subscribe/unsubscribe requests to the gateway, and dispatches incoming event payloads to stored callbacks.                                                                                                                                   | `<firebolt/helpers.h>` (transport package)               |
 | JSON type adapters     | Per-domain structs under `json_types/` that bridge `nlohmann::json` deserialization to typed C++ domain structs. Each domain has a corresponding header (e.g., `json_types/device.h`, `json_types/lifecycle.h`).                                                                                                                                                                    | `src/json_types/*.h`                                     |
 
 ---
 
 ## Component Interactions
 
-All interactions are with the Firebolt platform service, routed through the `firebolt-cpp-transport` WebSocket channel. Each domain implementation uses the `IHelper` interface to dispatch JSON-RPC requests and register for event notifications.
+All interactions are with the Firebolt platform service, routed through the `firebolt-cpp-transport` WebSocket channel.
 
 ### Interaction Matrix
 
 | Target Component / Layer      | Interaction Purpose                                                                                | Key APIs / Topics                                                                                                                                  |
 | ----------------------------- | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **firebolt-cpp-transport**    | WebSocket session management and JSON-RPC request/response dispatch                                | `GetGatewayInstance().connect()`, `GetGatewayInstance().disconnect()`, `IHelper::get()`, `IHelper::invoke()`                                       |
+| **firebolt-cpp-transport**    | WebSocket session management and JSON-RPC request/response dispatch                                | `Connect()` / `Disconnect()` lifecycle; JSON-RPC get and invoke operations routed through the transport                                            |
 | **Firebolt Platform Service** | Platform-side Firebolt API endpoint — receives JSON-RPC method calls and emits event notifications | `Device.chipsetId`, `Lifecycle2.state`, `Lifecycle2.close`, `Accessibility.closedCaptionsSettings`, `TextToSpeech.speak`, `Actions.onIntent`, etc. |
-| **nlohmann_json**             | JSON parameter serialization for outgoing requests                                                 | Used in all `*_impl.cpp` files to construct `nlohmann::json` parameter objects                                                                     |
 
 ### Platform Event Subscriptions
 
@@ -277,15 +275,15 @@ The subscription model delivers platform event notifications to the application 
 sequenceDiagram
     participant App as Application
     participant DomainImpl as Domain Impl (e.g. LocalizationImpl)
-    participant Helper as IHelper (Transport)
+    participant Transport as firebolt-cpp-transport
     participant FBService as Firebolt Platform Service
 
     App->>DomainImpl: timeZone()
-    DomainImpl->>Helper: get<JSON::String, string>("Localization.timeZone")
-    Helper->>FBService: JSON-RPC Request {"method":"Localization.timeZone"}
-    FBService-->>Helper: JSON-RPC Response {"result":"America/New_York"}
-    Helper-->>DomainImpl: Result<string>
-    DomainImpl-->>App: Result<string>("America/New_York")
+    DomainImpl->>Transport: JSON-RPC request (Localization.timeZone)
+    Transport->>FBService: JSON-RPC request
+    FBService-->>Transport: JSON-RPC response
+    Transport-->>DomainImpl: Result<string>
+    DomainImpl-->>App: Result<string>
 ```
 
 **Event Notification Flow:**
@@ -294,13 +292,12 @@ sequenceDiagram
 sequenceDiagram
     participant FBService as Firebolt Platform Service
     participant Transport as firebolt-cpp-transport
-    participant SubMgr as SubscriptionManager
+    participant DomainImpl as Domain Impl (e.g. NetworkImpl)
     participant App as Application Callback
 
     FBService->>Transport: JSON-RPC event Network.onConnectedChanged
-    Transport->>SubMgr: Dispatch to registered handler for SubscriptionId
-    SubMgr->>SubMgr: Deserialize JSON payload via type adapter
-    SubMgr->>App: callback(true)
+    Transport->>DomainImpl: dispatch to registered callback
+    DomainImpl->>App: callback(true)
 ```
 
 ---
@@ -309,16 +306,16 @@ sequenceDiagram
 
 ### Key Implementation Logic
 
-- **State / Lifecycle Management**: Connection state is managed entirely by the transport. The `FireboltAccessorImpl` destructor ensures all subscriptions are released before the gateway disconnects.
+- **State / Lifecycle Management**: The `FireboltAccessorImpl` destructor releases all active subscriptions before delegating disconnect to the transport.
   - Connection management: `src/firebolt.cpp`
 
-- **Event Processing**: Each subscription-capable domain implementation instantiates a `SubscriptionManager` (from `firebolt-cpp-transport`). On `subscribe*()` calls, the domain passes the JSON-RPC event topic name and a typed `std::function` callback to the subscription manager, which registers the handler with the transport. When an event arrives, the manager deserializes the JSON payload using the domain-specific JSON adapter type parameter and invokes the stored callback directly.
+- **Event Processing**: Each subscription-capable domain registers event topic handlers with the transport on `subscribe*()` calls. When an event arrives, the payload is deserialized via the domain-specific JSON type adapter and delivered to the registered callback.
 
-- **JSON Serialization Strategy**: Request parameters are constructed as `nlohmann::json` objects in each `*_impl.cpp` method. Optional parameters are included in the JSON object only when their `std::optional` value is present. Response deserialization relies on templated JSON adapter structs in `src/json_types/`.
+- **JSON Serialization Strategy**: Request parameters are serialized per domain in `*_impl.cpp` files. Optional parameters are included only when their `std::optional` value is present. Response deserialization relies on templated JSON adapter structs in `src/json_types/`.
 
-- **Error Handling Strategy**: All API methods return a `Result<T>` type (defined in `<firebolt/types.h>` from the transport package). Callers check the result for success or error before accessing the value. Errors from the transport are propagated to the caller as-is.
+- **Error Handling Strategy**: All API methods return a `Result<T>` type. Callers check the result for success or error before accessing the value.
 
-- **Logging & Diagnostics**: The `FIREBOLT_LOG_NOTICE` macro (from the transport package) is used in `firebolt.cpp` to log the client library version string at connection time. Verbosity is controlled by the `LogLevel` parameter in `Firebolt::Config`.
+- **Logging & Diagnostics**: The client library version string is logged at connection time. Verbosity is controlled by the `LogLevel` parameter in `Firebolt::Config`.
 
 ---
 
