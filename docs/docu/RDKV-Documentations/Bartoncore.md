@@ -32,7 +32,7 @@ classDef VL stroke:#808080,fill:#F2F2F2,stroke-width:2px;
         OTBR["otbr-agent (Thread Border Router)"]
     end
 
-    Apps -->|"GObject API (BCoreClient)"| BartonCore
+    Apps -->|"BCoreClient (GObject API)"| BartonCore
     BartonCore -->|"SDK linkage"| MatterSDK
     BartonCore -->|"JSON over IPC"| ZHAL
     BartonCore -->|"DBus"| OTBR
@@ -53,7 +53,7 @@ classDef VL stroke:#808080,fill:#F2F2F2,stroke-width:2px;
 - **Device Allow and Deny Lists**: Downloads and enforces allow and deny lists for device pairing, with retry logic and configurable update intervals.
 - **Persistent Storage**: Maintains a per-device JSON database on disk, with an in-memory cache and dirty-tracking for efficient writes.
 - **Observability and Telemetry**: Collects runtime metrics through a pluggable observability backend and exposes them as a JSON dump via `b_core_client_get_telemetry()`.
-- **Proactive Fault Detection**: Tracks device network health statistics (LQI, RSSI, PAN ID attacks for Zigbee) and surfaces detected anomalies as events.
+- **Proactive Fault Detection**: Tracks device network health statistics (Link Quality Indicator (LQI), Received Signal Strength Indicator (RSSI), Personal Area Network Identifier (PAN ID) attacks for Zigbee) and surfaces detected anomalies as events.
 
 ---
 
@@ -366,9 +366,9 @@ sequenceDiagram
 
 ## Implementation Details
 
-### Major HAL APIs Integration
+### Key External API Integrations
 
-| HAL / Protocol API                                         | Purpose                                                                                                          | Implementation File                                                                                          |
+| API / Interface                                            | Purpose                                                                                                          | Implementation File                                                                                          |
 | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `zhal_*` (ZHAL API)                                        | Zigbee network initialization, message send/receive, attribute report handling, and OTA firmware operations      | `core/src/subsystems/zigbee/zigbeeSubsystem.c`                                                               |
 | Matter SDK (`chip::Server`, `chip::CommissioningDelegate`) | Matter stack initialization, device commissioning orchestration, attribute subscription, OTA provider management | `core/src/subsystems/matter/matterSubsystem.cpp`, `core/src/subsystems/matter/CommissioningOrchestrator.cpp` |
@@ -409,21 +409,28 @@ sequenceDiagram
 
 ### Key Configuration Parameters
 
-| Parameter                                  | Type   | Default                               | Description                                                                                                |
-| ------------------------------------------ | ------ | ------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `storage-dir`                              | string | `/tmp/barton/device_service/storage`  | Root directory for device database and configuration persistence                                           |
-| `firmware-file-dir`                        | string | `/tmp/barton/device_service/firmware` | Directory for firmware files used during OTA update operations                                             |
-| `matter-storage-dir`                       | string | caller-provided                       | Directory for Matter SDK persistent storage (fabrics, counters, key-value store)                           |
-| `matter-attestation-trust-store-dir`       | string | caller-provided                       | Directory containing trusted certificate authorities for Matter device attestation                         |
-| `account-id`                               | string | caller-provided                       | Account identifier supplied to credential and token providers                                              |
-| `sbmd-dirs`                                | string | caller-provided                       | Semicolon-delimited list of directories scanned for `.sbmd.js` specification files at startup              |
-| `BCORE_ZIGBEE` (build)                     | bool   | `ON`                                  | Enables Zigbee protocol subsystem and ZHAL integration                                                     |
-| `BCORE_MATTER` (build)                     | bool   | `ON`                                  | Enables Matter protocol subsystem and SDK linkage                                                          |
-| `BCORE_THREAD` (build)                     | bool   | `ON`                                  | Enables Thread protocol subsystem and D-Bus integration with `otbr-agent`                                  |
-| `BCORE_BUILD_REFERENCE` (build)            | bool   | `ON`                                  | Builds the `brtn-ds-reference` interactive CLI reference application                                       |
-| `BCORE_MATTER_ENABLE_OTA_PROVIDER` (build) | bool   | `OFF`                                 | Enables the Matter OTA Provider role and configures devices with the OTA Requestor cluster                 |
-| `BCORE_MATTER_VALIDATE_SCHEMAS` (build)    | bool   | `ON`                                  | Enables JSON schema validation of SBMD specification files at load time                                    |
-| `BCORE_OBSERVABILITY_BACKEND` (build)      | string | `memory`                              | Selects the observability metrics backend; `memory` retains metrics in-process, `none` disables collection |
+**Runtime Parameters**
+
+| Parameter                            | Type   | Default                               | Description                                                                                   |
+| ------------------------------------ | ------ | ------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `storage-dir`                        | string | `/tmp/barton/device_service/storage`  | Root directory for device database and configuration persistence                              |
+| `firmware-file-dir`                  | string | `/tmp/barton/device_service/firmware` | Directory for firmware files used during OTA update operations                                |
+| `matter-storage-dir`                 | string | caller-provided                       | Directory for Matter SDK persistent storage (fabrics, counters, key-value store)              |
+| `matter-attestation-trust-store-dir` | string | caller-provided                       | Directory containing trusted certificate authorities for Matter device attestation            |
+| `account-id`                         | string | caller-provided                       | Account identifier supplied to credential and token providers                                 |
+| `sbmd-dirs`                          | string | caller-provided                       | Semicolon-delimited list of directories scanned for `.sbmd.js` specification files at startup |
+
+**Build-Time Configuration Flags**
+
+| Flag                               | Type   | Default  | Description                                                                                                |
+| ---------------------------------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------- |
+| `BCORE_ZIGBEE`                     | bool   | `ON`     | Enables Zigbee protocol subsystem and ZHAL integration                                                     |
+| `BCORE_MATTER`                     | bool   | `ON`     | Enables Matter protocol subsystem and SDK linkage                                                          |
+| `BCORE_THREAD`                     | bool   | `ON`     | Enables Thread protocol subsystem and D-Bus integration with `otbr-agent`                                  |
+| `BCORE_BUILD_REFERENCE`            | bool   | `ON`     | Builds the `brtn-ds-reference` interactive CLI reference application                                       |
+| `BCORE_MATTER_ENABLE_OTA_PROVIDER` | bool   | `OFF`    | Enables the Matter OTA Provider role and configures devices with the OTA Requestor cluster                 |
+| `BCORE_MATTER_VALIDATE_SCHEMAS`    | bool   | `ON`     | Enables JSON schema validation of SBMD specification files at load time                                    |
+| `BCORE_OBSERVABILITY_BACKEND`      | string | `memory` | Selects the observability metrics backend; `memory` retains metrics in-process, `none` disables collection |
 
 ### Runtime Configuration
 
