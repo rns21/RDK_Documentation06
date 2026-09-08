@@ -20,7 +20,7 @@ flowchart LR
 %% Middleware
     subgraph RDKMW["RDK Core Middleware"]
         OCDM["WPEFramework OCDM\n(OpenCDMi Plugin)"]
-        PR["PlayReady OCDM\n(CDMi Backend)"]
+        PR["PlayReady OCDM\n(OpenCDMi Backend)"]
         Thunder["WPEFramework (Thunder)"]
     end
 
@@ -61,7 +61,7 @@ The component is structured around two layers: a system-level context managed by
 
 PlayReady SDK calls that use the shared `DRM_APP_CONTEXT` are serialized through a global `CriticalSection` (`drmAppContextMutex_`) to ensure thread safety. Platform initialization is guarded separately by `prPlatformMutex_` using a reference counter so that concurrent callers do not double-initialize. Session construction is protected by `prSessionMutex_`.
 
-The component's northbound interface is the CDMi `IMediaKeys` and `IMediaKeysExt` API consumed by the WPEFramework OCDM Plugin (OpenCDMi) — the Thunder plugin responsible for discovering and loading CDMi backend shared libraries and routing EME-layer requests to them. Its southbound interface covers two paths: PlayReady SDK calls for all DRM operations (directed to SoC-provided DRM libraries), and `gst-svp-ext` calls for SVP secure memory management — `gst-svp-ext` provides a generic interface where GStreamer SVP-specific platform handling is passed through to the underlying platform HAL. Configuration is delivered as a JSON string at `Initialize()` time, from which the DRM data directory, store path, and HOME environment variable are extracted.
+The component's northbound interface is the CDMi `IMediaKeys` and `IMediaKeysExt` API consumed by the WPEFramework OCDM Plugin (OpenCDMi) — the Thunder plugin responsible for discovering and loading OpenCDMi backend shared libraries and routing EME-layer requests to them. Its southbound interface covers two paths: PlayReady SDK calls for all DRM operations (directed to SoC-provided DRM libraries), and `gst-svp-ext` calls for SVP secure memory management — `gst-svp-ext` provides a generic interface where GStreamer SVP-specific platform handling is passed through to the underlying platform HAL. Configuration is delivered as a JSON string at `Initialize()` time, from which the DRM data directory, store path, and HOME environment variable are extracted.
 
 The DRM store is persisted on the filesystem at the path specified by the `store-location` configuration parameter and is managed by the PlayReady SDK. The component performs a cleanup pass at startup to remove expired licenses. In-memory licenses are removed when the session closes. Temporary persistent licenses acquired during a session are tracked and deleted on session close to prevent unbounded accumulation.
 
@@ -114,7 +114,7 @@ graph LR
 ### Platform and Integration Requirements
 
 - **Build Dependencies**: `wpeframework`, `wpeframework-clientlibraries`, `wpeframework-tools-native`, `entservices-apis`, `gst-svp-ext`, `gstreamer1.0`, OpenSSL. Platform-specific PlayReady library resolved via `platform-playready-depends` and `platform-playready-flags` Yocto variables.
-- **Component Dependencies**: The WPEFramework OCDM Plugin (OpenCDMi) must be active; this CDMi backend is loaded by the OCDM Plugin (OpenCDMi) at startup.
+- **Component Dependencies**: The WPEFramework OCDM Plugin (OpenCDMi) must be active; this OpenCDMi backend is loaded by the OCDM Plugin (OpenCDMi) at startup.
 - **SVP Integration**: `gst-svp-ext` is used for secure memory allocation and token management during decryption. The `gst-svp-ext` generic interface delegates platform-specific SVP operations to the underlying platform HAL.
 - **Systemd Services**: When run under `systemd`, the component's stdout/stderr logging can be captured by journald (depending on the unit configuration).
 - **Configuration Files**: JSON configuration string delivered by the WPEFramework configuration system at component initialization, containing `read-dir`, `store-location`, and `home-path` fields.
@@ -133,7 +133,7 @@ The component transitions through the following states during its lifecycle: **I
 ```mermaid
 sequenceDiagram
     participant OCDM as WPEFramework OCDM Plugin (OpenCDMi)
-    participant PR as PlayReady OCDM (CDMi Backend)
+    participant PR as PlayReady OCDM (OpenCDMi Backend)
     participant SVP as gst-svp-ext (Generic)
     participant PRSDK as PlayReady SDK (SoC DRM)
 
@@ -208,7 +208,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant OCDM as OCDM (OpenCDMi)
-    participant PR as PlayReady OCDM (CDMi Backend)
+    participant PR as PlayReady OCDM (OpenCDMi Backend)
     participant SVP as gst-svp-ext (Generic)
     participant PRSDK as PlayReady SDK (SoC DRM)
 
@@ -233,7 +233,7 @@ sequenceDiagram
 sequenceDiagram
     participant App as Application / WPE Runtime
     participant OCDM as OCDM (OpenCDMi)
-    participant PR as PlayReady OCDM (CDMi Backend)
+    participant PR as PlayReady OCDM (OpenCDMi Backend)
     participant PRSDK as PlayReady SDK (SoC DRM)
     participant LS as License Server
 
@@ -270,7 +270,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant OCDM as OCDM (OpenCDMi)
-    participant PR as PlayReady OCDM (CDMi Backend)
+    participant PR as PlayReady OCDM (OpenCDMi Backend)
     participant SVP as gst-svp-ext (Generic)
     participant PRSDK as PlayReady SDK (SoC DRM)
 
@@ -306,31 +306,31 @@ The component's interactions are with the WPEFramework OCDM Plugin — OpenCDMi 
 
 ### Interaction Matrix
 
-| Target Component / Layer                           | Interaction Purpose                                                                            | Key APIs / Topics                                                                                                                                                          |
-| -------------------------------------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **WPEFramework OCDM Plugin (OpenCDMi)**            |                                                                                                |                                                                                                                                                                            |
-| OCDM Plugin (OpenCDMi)                             | CDMi interface entry points — discovers and loads this CDMi backend, routes EME requests to it | `IMediaKeys::CreateMediaKeySession`, `IMediaKeysExt::InitSystemExt`, `IMediaKeysExt::TeardownSystemExt`, `IMediaKeysExt::GetSecureStop`, `IMediaKeysExt::CommitSecureStop` |
-| `IMediaKeySessionCallback`                         | Session event delivery to the OCDM caller                                                      | `OnKeyMessage`, `OnKeyStatusUpdate`, `OnKeyStatusesUpdated`, `OnError`                                                                                                     |
-| **PlayReady SDK**                                  |                                                                                                |                                                                                                                                                                            |
-|                                                    | DRM platform and application context lifecycle                                                 | `Drm_Platform_Initialize`, `Drm_Platform_Uninitialize`, `Drm_Initialize`, `Drm_Uninitialize`, `Drm_Reinitialize`                                                           |
-|                                                    | Content header parsing and key selection                                                       | `Drm_Content_SetProperty` with `DRM_CSP_AUTODETECT_HEADER`, `DRM_CSP_SELECT_KID`, `DRM_CSP_DECRYPTION_OUTPUT_MODE`                                                         |
-|                                                    | License acquisition                                                                            | `Drm_LicenseAcq_GenerateChallenge`, `Drm_LicenseAcq_ProcessResponse`                                                                                                       |
-|                                                    | Decrypt context binding and content decryption                                                 | `Drm_Reader_Bind`, `Drm_Reader_Commit`, `Drm_Reader_Close`, `Drm_Reader_DecryptOpaque`, `Drm_Reader_DecryptMultipleOpaque`                                                 |
-|                                                    | Revocation data management                                                                     | `Drm_Revocation_SetBuffer`                                                                                                                                                 |
-|                                                    | Secure time and anti-rollback clock                                                            | `Drm_SecureTime_GetValue`, `Drm_AntiRollBackClock_Init`                                                                                                                    |
-|                                                    | Secure Stop session management                                                                 | `Drm_SecureStop_EnumerateSessions`, `Drm_SecureStop_GenerateChallenge`, `Drm_SecureStop_ProcessResponse`                                                                   |
-|                                                    | License store maintenance                                                                      | `Drm_StoreMgmt_CleanupStore`, `Drm_StoreMgmt_DeleteLicenses`, `Drm_StoreMgmt_DeleteInMemoryLicenses`                                                                       |
-| **gst-svp-ext (Generic Interface → Platform HAL)** |                                                                                                |                                                                                                                                                                            |
-|                                                    | Platform PlayReady initialization and teardown                                                 | `svpPlatformInitializePlayready`, `svpPlatformUninitializePlayready`                                                                                                       |
-|                                                    | DRM and platform context provisioning                                                          | `svpGetDrmOEMContext`, `svpGetDrmPlatformInitData`                                                                                                                         |
-|                                                    | DRM storage path resolution                                                                    | `svpGetDrmStoragePath`                                                                                                                                                     |
-|                                                    | Revocation list loading and clock initialization flag                                          | `svpLoadRevocationList`, `svpIsSecureClockInitNeed`                                                                                                                        |
-|                                                    | Secure buffer lifecycle for decrypted video                                                    | `svp_allocate_secure_buffers`, `svp_release_secure_buffers`, `svp_buffer_alloc_token`, `svp_buffer_to_token`, `svp_buffer_free_token`, `svp_token_size`                    |
-|                                                    | SVP context lifecycle                                                                          | `gst_svp_ext_get_context`, `gst_svp_ext_free_context`                                                                                                                      |
-|                                                    | SVP buffer header inspection and update                                                        | `gst_svp_has_header`, `gst_svp_header_get_start_of_data`, `gst_svp_header_get_field`, `gst_svp_header_set_field`                                                           |
-|                                                    | Per-stream decrypt path capability queries                                                     | `svpIsAudioNeedNonSVPContext`, `svpIsVideoResCheckNeed`, `svpIsDynamicSVPEncEnabled`, `svpIsMultipleOpaqueSupportCTR`                                                      |
-| **External Systems**                               |                                                                                                |                                                                                                                                                                            |
-| License Server                                     | License challenge dispatch and response retrieval                                              | HTTP POST (the caller handles transport; the component generates the challenge binary and processes the response binary)                                                   |
+| Target Component / Layer                           | Interaction Purpose                                                                                | Key APIs / Topics                                                                                                                                                          |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **WPEFramework OCDM Plugin (OpenCDMi)**            |                                                                                                    |                                                                                                                                                                            |
+| OCDM Plugin (OpenCDMi)                             | CDMi interface entry points — discovers and loads this OpenCDMi backend, routes EME requests to it | `IMediaKeys::CreateMediaKeySession`, `IMediaKeysExt::InitSystemExt`, `IMediaKeysExt::TeardownSystemExt`, `IMediaKeysExt::GetSecureStop`, `IMediaKeysExt::CommitSecureStop` |
+| `IMediaKeySessionCallback`                         | Session event delivery to the OCDM caller                                                          | `OnKeyMessage`, `OnKeyStatusUpdate`, `OnKeyStatusesUpdated`, `OnError`                                                                                                     |
+| **PlayReady SDK**                                  |                                                                                                    |                                                                                                                                                                            |
+|                                                    | DRM platform and application context lifecycle                                                     | `Drm_Platform_Initialize`, `Drm_Platform_Uninitialize`, `Drm_Initialize`, `Drm_Uninitialize`, `Drm_Reinitialize`                                                           |
+|                                                    | Content header parsing and key selection                                                           | `Drm_Content_SetProperty` with `DRM_CSP_AUTODETECT_HEADER`, `DRM_CSP_SELECT_KID`, `DRM_CSP_DECRYPTION_OUTPUT_MODE`                                                         |
+|                                                    | License acquisition                                                                                | `Drm_LicenseAcq_GenerateChallenge`, `Drm_LicenseAcq_ProcessResponse`                                                                                                       |
+|                                                    | Decrypt context binding and content decryption                                                     | `Drm_Reader_Bind`, `Drm_Reader_Commit`, `Drm_Reader_Close`, `Drm_Reader_DecryptOpaque`, `Drm_Reader_DecryptMultipleOpaque`                                                 |
+|                                                    | Revocation data management                                                                         | `Drm_Revocation_SetBuffer`                                                                                                                                                 |
+|                                                    | Secure time and anti-rollback clock                                                                | `Drm_SecureTime_GetValue`, `Drm_AntiRollBackClock_Init`                                                                                                                    |
+|                                                    | Secure Stop session management                                                                     | `Drm_SecureStop_EnumerateSessions`, `Drm_SecureStop_GenerateChallenge`, `Drm_SecureStop_ProcessResponse`                                                                   |
+|                                                    | License store maintenance                                                                          | `Drm_StoreMgmt_CleanupStore`, `Drm_StoreMgmt_DeleteLicenses`, `Drm_StoreMgmt_DeleteInMemoryLicenses`                                                                       |
+| **gst-svp-ext (Generic Interface → Platform HAL)** |                                                                                                    |                                                                                                                                                                            |
+|                                                    | Platform PlayReady initialization and teardown                                                     | `svpPlatformInitializePlayready`, `svpPlatformUninitializePlayready`                                                                                                       |
+|                                                    | DRM and platform context provisioning                                                              | `svpGetDrmOEMContext`, `svpGetDrmPlatformInitData`                                                                                                                         |
+|                                                    | DRM storage path resolution                                                                        | `svpGetDrmStoragePath`                                                                                                                                                     |
+|                                                    | Revocation list loading and clock initialization flag                                              | `svpLoadRevocationList`, `svpIsSecureClockInitNeed`                                                                                                                        |
+|                                                    | Secure buffer lifecycle for decrypted video                                                        | `svp_allocate_secure_buffers`, `svp_release_secure_buffers`, `svp_buffer_alloc_token`, `svp_buffer_to_token`, `svp_buffer_free_token`, `svp_token_size`                    |
+|                                                    | SVP context lifecycle                                                                              | `gst_svp_ext_get_context`, `gst_svp_ext_free_context`                                                                                                                      |
+|                                                    | SVP buffer header inspection and update                                                            | `gst_svp_has_header`, `gst_svp_header_get_start_of_data`, `gst_svp_header_get_field`, `gst_svp_header_set_field`                                                           |
+|                                                    | Per-stream decrypt path capability queries                                                         | `svpIsAudioNeedNonSVPContext`, `svpIsVideoResCheckNeed`, `svpIsDynamicSVPEncEnabled`, `svpIsMultipleOpaqueSupportCTR`                                                      |
+| **External Systems**                               |                                                                                                    |                                                                                                                                                                            |
+| License Server                                     | License challenge dispatch and response retrieval                                                  | HTTP POST (the caller handles transport; the component generates the challenge binary and processes the response binary)                                                   |
 
 ### Events Published
 
@@ -351,7 +351,7 @@ The WPEFramework OCDM Plugin (OpenCDMi) dispatches CDMi API calls directly in-pr
 sequenceDiagram
     participant App as Application
     participant OCDM as OCDM (OpenCDMi)
-    participant PR as PlayReady OCDM (CDMi Backend)
+    participant PR as PlayReady OCDM (OpenCDMi Backend)
     participant PRSDK as PlayReady SDK (SoC DRM)
 
     App->>OCDM: EME API call
@@ -369,7 +369,7 @@ Key status events are posted synchronously from within the `Update()` and `playr
 ```mermaid
 sequenceDiagram
     participant PRSDK as PlayReady SDK (SoC DRM)
-    participant PR as PlayReady OCDM (CDMi Backend)
+    participant PR as PlayReady OCDM (OpenCDMi Backend)
     participant CB as IMediaKeySessionCallback
     participant App as Application
 
